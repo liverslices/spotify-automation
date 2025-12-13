@@ -26,8 +26,8 @@ LOG_FILE = LOG_DIR / "junk_mover.log"
 
 
 def load_env_from_root() -> None:
-    # Keep secrets/config centralized in the repo-level .env for portability.
     """Load .env values from the project root into os.environ if present."""
+    # Keep secrets/config centralized in the repo-level .env for portability.
     env_path = ROOT / ".env"
     if not env_path.exists():
         return
@@ -40,6 +40,7 @@ def load_env_from_root() -> None:
 
 
 def require_env(keys: List[str]) -> None:
+    """Ensure all required environment variables are populated before execution."""
     # Surface missing configuration early with a clear error.
     missing = [key for key in keys if not os.environ.get(key)]
     if missing:
@@ -49,6 +50,7 @@ def require_env(keys: List[str]) -> None:
 
 
 def setup_logging() -> None:
+    """Configure file + stdout logging with daily rotation and year-long retention."""
     # Rotate logs daily and retain a year for lightweight Pi-friendly observability.
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     handler = logging.handlers.TimedRotatingFileHandler(
@@ -63,6 +65,7 @@ def setup_logging() -> None:
 
 
 def fetch_access_token(client_id: str, client_secret: str, refresh_token: str) -> str:
+    """Swap the long-lived refresh token for a short-lived bearer token for API calls."""
     # Use refresh token flow so this can run unattended on a schedule.
     data = parse.urlencode(
         {
@@ -94,6 +97,7 @@ def spotify_request(
     params: Optional[Dict[str, Any]] = None,
     data: Optional[Any] = None,
 ) -> Dict[str, Any]:
+    """Perform a Spotify Web API request with consistent headers, encoding, and errors."""
     # Minimal helper around urllib with uniform error handling and JSON bodies.
     if params:
         url = f"{url}?{parse.urlencode(params)}"
@@ -110,7 +114,12 @@ def spotify_request(
         with request.urlopen(req) as resp:
             if resp.status == 204:
                 return {}
-            return json.load(resp)
+            raw_body = resp.read()
+            if not raw_body:
+                return {}
+            return json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Spotify API returned non-JSON body") from exc
     except error.HTTPError as exc:
         detail = exc.read().decode()
         raise RuntimeError(f"Spotify API error {exc.status}: {detail}") from exc
@@ -118,11 +127,25 @@ def spotify_request(
         raise RuntimeError(f"Network error calling Spotify: {exc.reason}") from exc
 
 
+def update_playlist_description(access_token: str, playlist_id: str, description: str) -> None:
+    """Update a playlist's description string for user-facing audit context."""
+    # Annotate playlists with the latest run details for quick auditing in the UI.
+    spotify_request(
+        "PUT",
+        f"https://api.spotify.com/v1/playlists/{playlist_id}",
+        access_token,
+        data={"description": description},
+    )
+    logging.info("Updated description for playlist %s", playlist_id)
+
+
 def get_current_user(access_token: str) -> Dict[str, Any]:
+    """Return the authenticated user's profile, including ID and display name."""
     return spotify_request("GET", "https://api.spotify.com/v1/me", access_token)
 
 
 def paginate_playlists(access_token: str) -> Iterable[Dict[str, Any]]:
+    """Yield all playlists accessible to the user, paging through Spotify results."""
     # Iterate through all playlists without manual paging logic elsewhere.
     url = "https://api.spotify.com/v1/me/playlists"
     params = {"limit": 50, "offset": 0}
@@ -138,6 +161,7 @@ def paginate_playlists(access_token: str) -> Iterable[Dict[str, Any]]:
 def find_playlist_by_name_owner(
     access_token: str, owner_id: str, target_name: str
 ) -> Optional[Dict[str, Any]]:
+    """Locate a playlist by exact name that is owned by the given user ID."""
     # Ensure we act only on playlists owned by the authenticated user.
     for playlist in paginate_playlists(access_token):
         if (
@@ -149,6 +173,7 @@ def find_playlist_by_name_owner(
 
 
 def paginate_playlist_items(access_token: str, playlist_id: str) -> Iterable[Dict[str, Any]]:
+    """Yield every track item from the specified playlist, handling pagination."""
     # Stream all tracks from a playlist, respecting API paging.
     url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
     params = {"limit": 100, "offset": 0}
@@ -164,6 +189,7 @@ def paginate_playlist_items(access_token: str, playlist_id: str) -> Iterable[Dic
 def ensure_junk_drawer_playlist(
     access_token: str, user_id: str, name: str, description: str
 ) -> str:
+    """Return ID of the named Junk Drawer playlist, creating it if absent."""
     # Create the destination playlist on-demand to keep runs idempotent.
     existing = find_playlist_by_name_owner(access_token, user_id, name)
     if existing:
@@ -182,6 +208,7 @@ def ensure_junk_drawer_playlist(
 
 
 def add_tracks_to_playlist(access_token: str, playlist_id: str, uris: List[str]) -> None:
+    """Add the given track URIs to a playlist in Spotify-compliant batches of 100."""
     # Add tracks in batches to respect API limits.
     for chunk in chunked(uris, 100):
         spotify_request(
@@ -194,6 +221,7 @@ def add_tracks_to_playlist(access_token: str, playlist_id: str, uris: List[str])
 
 
 def remove_tracks_from_playlist(access_token: str, playlist_id: str, uris: List[str]) -> None:
+    """Remove the given track URIs from a playlist in batches to honor API limits."""
     # Remove tracks in batches to respect API limits.
     for chunk in chunked(uris, 100):
         spotify_request(
@@ -206,11 +234,13 @@ def remove_tracks_from_playlist(access_token: str, playlist_id: str, uris: List[
 
 
 def chunked(seq: List[str], size: int) -> Iterable[List[str]]:
+    """Yield sequential slices from a list with the requested maximum length."""
     for i in range(0, len(seq), size):
         yield seq[i : i + size]
 
 
 def iso_to_date(iso_ts: str) -> dt.date:
+    """Convert an ISO 8601 timestamp (with trailing Z) to a naive date for comparisons."""
     # Normalize Spotify's timestamp into a date for age comparisons.
     # Spotify returns ISO timestamps like "2025-11-29T12:34:56Z"
     clean = iso_ts.rstrip("Z")
@@ -220,6 +250,7 @@ def iso_to_date(iso_ts: str) -> dt.date:
 def group_tracks_by_year_suffix(
     tracks: List[Tuple[str, dt.date]]
 ) -> Dict[str, List[Tuple[str, dt.date]]]:
+    """Group (uri, added_date) pairs by two-digit year suffix for playlist routing."""
     # Bucket tracks by year suffix to route them into the correct Junk Drawer.
     buckets: Dict[str, List[Tuple[str, dt.date]]] = {}
     for uri, added_date in tracks:
@@ -229,6 +260,7 @@ def group_tracks_by_year_suffix(
 
 
 def main() -> None:
+    """Entry point: authenticate, find source playlist, move aged tracks, and annotate playlists."""
     # Load configuration from .env before anything else so secrets are available.
     load_env_from_root()
     # Set up file + stdout logging so runs on a Pi leave history for 1 year.
@@ -291,26 +323,38 @@ def main() -> None:
     if not candidates:
         return
 
+    run_timestamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    total_moved = 0
     # Group tracks by year suffix so each batch goes to the right Junk Drawer.
     buckets = group_tracks_by_year_suffix(candidates)
     for year_suffix, tracks in buckets.items():
         playlist_name = f"{year_suffix} Junk Drawer"
-        description = f"Archive of tracks added in {year_suffix} from {source_playlist_name}"
+        base_description = f"Junk drawer of tracks added in {year_suffix} from {source_playlist_name}"
         # Create/find the destination playlist for this year bucket.
         target_playlist_id = ensure_junk_drawer_playlist(
-            access_token, user_id, playlist_name, description
+            access_token, user_id, playlist_name, base_description
         )
 
         uris = [uri for uri, _ in tracks]
         # Move the tracks: add to the destination, then remove from the source.
         add_tracks_to_playlist(access_token, target_playlist_id, uris)
         remove_tracks_from_playlist(access_token, source_playlist_id, uris)
+        total_moved += len(uris)
+
+        description = f"{base_description}. Last run {run_timestamp} moved {len(uris)} tracks."
+        update_playlist_description(access_token, target_playlist_id, description)
         logging.info(
             "Moved %d tracks to '%s' from '%s'",
             len(uris),
             playlist_name,
             source_playlist_name,
         )
+
+    source_description = (
+        f"{source_playlist_name} (managed by Junk Mover). "
+        f"Last run {run_timestamp} moved {total_moved} tracks to junk drawers."
+    )
+    update_playlist_description(access_token, source_playlist_id, source_description)
 
 
 if __name__ == "__main__":
