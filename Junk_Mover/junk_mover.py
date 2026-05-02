@@ -405,16 +405,18 @@ def main() -> None:
             existing = find_playlist_by_name_owner(access_token, user_id, playlist_name)
             if existing:
                 logging.info(
-                    "Dry run: would add %d tracks to existing playlist '%s' (%s)",
+                    "Dry run: would move %d tracks from '%s' to existing target playlist '%s' (%s)",
                     len(uris),
+                    source_playlist_name,
                     playlist_name,
                     existing["id"],
                 )
             else:
                 logging.info(
-                    "Dry run: would create playlist '%s' and add %d tracks",
+                    "Dry run: would create target playlist '%s' and move %d tracks from '%s' into it",
                     playlist_name,
                     len(uris),
+                    source_playlist_name,
                 )
             logging.info(
                 "Dry run: would remove %d tracks from source playlist '%s' (%s)",
