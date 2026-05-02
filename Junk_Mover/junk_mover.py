@@ -390,9 +390,9 @@ def main() -> None:
 
     run_timestamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     total_moved = 0
+    dry_run_targets: List[str] = []
     if args.dry_run:
-        logging.info(
-            "Dry run enabled; no Spotify write operations will be performed.")
+        logging.info("Dry run enabled; no Spotify write operations will be performed.")
 
     # Group tracks by year suffix so each batch goes to the right Junk Drawer.
     buckets = group_tracks_by_year_suffix(candidates)
@@ -402,6 +402,7 @@ def main() -> None:
         uris = [uri for uri, _ in tracks]
 
         if args.dry_run:
+            dry_run_targets.append(playlist_name)
             existing = find_playlist_by_name_owner(access_token, user_id, playlist_name)
             if existing:
                 logging.info(
@@ -446,10 +447,12 @@ def main() -> None:
         )
 
     if args.dry_run:
+        target_list = ", ".join(sorted(set(dry_run_targets)))
         logging.info(
-            "Dry run complete; would have moved %d tracks from '%s' into junk drawers.",
+            "Dry run complete; would have moved %d tracks from '%s' into junk drawers: %s.",
             total_moved,
             source_playlist_name,
+            target_list,
         )
         return
 
