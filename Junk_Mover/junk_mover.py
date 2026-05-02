@@ -9,6 +9,7 @@ Behavior:
   was added to the source playlist. Playlists are created if missing.
 """
 
+import argparse
 import base64
 import datetime as dt
 import json
@@ -158,18 +159,40 @@ def paginate_playlists(access_token: str) -> Iterable[Dict[str, Any]]:
         params["offset"] += params["limit"]
 
 
+def _normalize_playlist_name(name: Optional[str]) -> str:
+    """Normalize playlist names for safe comparison."""
+    return (name or "").strip().lower()
+
+
+def find_playlists_by_name_owner(
+    access_token: str, owner_id: str, target_name: str
+) -> List[Dict[str, Any]]:
+    """Return all playlists owned by the user with the matching name."""
+    normalized_target = _normalize_playlist_name(target_name)
+    matches: List[Dict[str, Any]] = []
+    for playlist in paginate_playlists(access_token):
+        if (
+            _normalize_playlist_name(playlist.get("name")) == normalized_target
+            and playlist.get("owner", {}).get("id") == owner_id
+        ):
+            matches.append(playlist)
+    return matches
+
+
 def find_playlist_by_name_owner(
     access_token: str, owner_id: str, target_name: str
 ) -> Optional[Dict[str, Any]]:
-    """Locate a playlist by exact name that is owned by the given user ID."""
-    # Ensure we act only on playlists owned by the authenticated user.
-    for playlist in paginate_playlists(access_token):
-        if (
-            playlist.get("name") == target_name
-            and playlist.get("owner", {}).get("id") == owner_id
-        ):
-            return playlist
-    return None
+    """Locate a playlist by name that is owned by the given user ID."""
+    matches = find_playlists_by_name_owner(access_token, owner_id, target_name)
+    if len(matches) > 1:
+        logging.warning(
+            "Found %d playlists owned by %s with name %r; using the first match %s.",
+            len(matches),
+            owner_id,
+            target_name,
+            matches[0].get("id"),
+        )
+    return matches[0] if matches else None
 
 
 def paginate_playlist_items(access_token: str, playlist_id: str) -> Iterable[Dict[str, Any]]:
@@ -190,10 +213,17 @@ def ensure_junk_drawer_playlist(
     access_token: str, user_id: str, name: str, description: str
 ) -> str:
     """Return ID of the named Junk Drawer playlist, creating it if absent."""
-    # Create the destination playlist on-demand to keep runs idempotent.
-    existing = find_playlist_by_name_owner(access_token, user_id, name)
+    # Create or re-use the destination playlist on-demand to keep runs idempotent.
+    existing = find_playlists_by_name_owner(access_token, user_id, name)
     if existing:
-        return existing["id"]
+        if len(existing) > 1:
+            logging.warning(
+                "Multiple existing playlists were found for %r; using %s and ignoring %d duplicate(s).",
+                name,
+                existing[0].get("id"),
+                len(existing) - 1,
+            )
+        return existing[0]["id"]
 
     body = {
         "name": name,
@@ -259,6 +289,34 @@ def group_tracks_by_year_suffix(
     return buckets
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse CLI flags for dry runs and duration selection."""
+    parser = argparse.ArgumentParser(
+        description="Move old songs from a source Spotify playlist into year-based Junk Drawer playlists."
+    )
+    parser.add_argument(
+        "--duration-days",
+        type=int,
+        default=None,
+        help=(
+            "Age threshold in days for moving tracks. "
+            "If omitted, reads JUNK_MOVER_DURATION_DAYS from environment."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be moved without changing Spotify playlists.",
+    )
+    parser.add_argument(
+        "--source-playlist",
+        type=str,
+        default=None,
+        help="Override JUNK_MOVER_SOURCE_PLAYLIST from environment.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """Entry point: authenticate, find source playlist, move aged tracks, and annotate playlists."""
     # Load configuration from .env before anything else so secrets are available.
@@ -266,29 +324,36 @@ def main() -> None:
     # Set up file + stdout logging so runs on a Pi leave history for 1 year.
     setup_logging()
 
+    args = parse_args()
+
     # Ensure all required inputs are present before making API calls.
     required_keys = [
         "JUNK_MOVER_CLIENT_ID",
         "JUNK_MOVER_CLIENT_SECRET",
         "JUNK_MOVER_REFRESH_TOKEN",
-        "JUNK_MOVER_SOURCE_PLAYLIST",
-        "JUNK_MOVER_DURATION_DAYS",
     ]
+    if args.source_playlist is None:
+        required_keys.append("JUNK_MOVER_SOURCE_PLAYLIST")
+    if args.duration_days is None:
+        required_keys.append("JUNK_MOVER_DURATION_DAYS")
     require_env(required_keys)
 
     # Parse the age threshold (in days) used to decide what gets moved.
-    try:
-        duration_days = int(os.environ["JUNK_MOVER_DURATION_DAYS"])
-    except ValueError as exc:
-        raise ValueError("JUNK_MOVER_DURATION_DAYS must be an integer") from exc
+    if args.duration_days is not None:
+        duration_days = args.duration_days
+    else:
+        try:
+            duration_days = int(os.environ["JUNK_MOVER_DURATION_DAYS"])
+        except ValueError as exc:
+            raise ValueError("JUNK_MOVER_DURATION_DAYS must be an integer") from exc
     if duration_days < 0:
-        raise ValueError("JUNK_MOVER_DURATION_DAYS cannot be negative; use 0 for 'today'.")
+        raise ValueError("Duration days cannot be negative; use 0 for 'today'.")
 
-    # Read credentials and source playlist name from environment.
+    # Read credentials and source playlist name from environment or CLI.
     client_id = os.environ["JUNK_MOVER_CLIENT_ID"]
     client_secret = os.environ["JUNK_MOVER_CLIENT_SECRET"]
     refresh_token = os.environ["JUNK_MOVER_REFRESH_TOKEN"]
-    source_playlist_name = os.environ["JUNK_MOVER_SOURCE_PLAYLIST"]
+    source_playlist_name = args.source_playlist or os.environ["JUNK_MOVER_SOURCE_PLAYLIST"]
 
     # Authenticate as the current user using the refresh token.
     access_token = fetch_access_token(client_id, client_secret, refresh_token)
@@ -325,17 +390,45 @@ def main() -> None:
 
     run_timestamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     total_moved = 0
+    if args.dry_run:
+        logging.info(
+            "Dry run enabled; no Spotify write operations will be performed.")
+
     # Group tracks by year suffix so each batch goes to the right Junk Drawer.
     buckets = group_tracks_by_year_suffix(candidates)
     for year_suffix, tracks in buckets.items():
         playlist_name = f"{year_suffix} Junk Drawer"
         base_description = f"Junk drawer of tracks added in {year_suffix} from {source_playlist_name}"
+        uris = [uri for uri, _ in tracks]
+
+        if args.dry_run:
+            existing = find_playlist_by_name_owner(access_token, user_id, playlist_name)
+            if existing:
+                logging.info(
+                    "Dry run: would add %d tracks to existing playlist '%s' (%s)",
+                    len(uris),
+                    playlist_name,
+                    existing["id"],
+                )
+            else:
+                logging.info(
+                    "Dry run: would create playlist '%s' and add %d tracks",
+                    playlist_name,
+                    len(uris),
+                )
+            logging.info(
+                "Dry run: would remove %d tracks from source playlist '%s' (%s)",
+                len(uris),
+                source_playlist_name,
+                source_playlist_id,
+            )
+            total_moved += len(uris)
+            continue
+
         # Create/find the destination playlist for this year bucket.
         target_playlist_id = ensure_junk_drawer_playlist(
             access_token, user_id, playlist_name, base_description
         )
-
-        uris = [uri for uri, _ in tracks]
         # Move the tracks: add to the destination, then remove from the source.
         add_tracks_to_playlist(access_token, target_playlist_id, uris)
         remove_tracks_from_playlist(access_token, source_playlist_id, uris)
@@ -349,6 +442,14 @@ def main() -> None:
             playlist_name,
             source_playlist_name,
         )
+
+    if args.dry_run:
+        logging.info(
+            "Dry run complete; would have moved %d tracks from '%s' into junk drawers.",
+            total_moved,
+            source_playlist_name,
+        )
+        return
 
     source_description = (
         f"{source_playlist_name} (managed by Junk Mover). "
